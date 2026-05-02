@@ -7,8 +7,14 @@ export const saveScannedCode = async (data) => {
     const existingCodesJson = await AsyncStorage.getItem(STORAGE_KEY);
     const existingCodes = existingCodesJson ? JSON.parse(existingCodesJson) : [];
     
-    // Check if we just scanned this recently (optional: prevent duplicate immediate scans)
-    // Here we just save everything.
+    // Check for duplicates
+    const isDuplicate = existingCodes.some(code => code.data === data);
+    if (isDuplicate) {
+      const error = new Error('DUPLICATE_CODE');
+      error.code = 'DUPLICATE_CODE';
+      throw error;
+    }
+    
     const newCode = {
       id: Date.now().toString(),
       data: data,

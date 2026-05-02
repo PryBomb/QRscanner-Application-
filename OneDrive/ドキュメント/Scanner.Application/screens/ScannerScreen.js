@@ -1,38 +1,65 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, Text, View, TouchableOpacity, Alert, SafeAreaView, Dimensions, Animated, Easing } from 'react-native';
+import { StyleSheet, Text, View, TouchableOpacity, SafeAreaView, Dimensions, Animated, Easing } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { saveScannedCode } from '../utils/storage';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
+import { BlurView } from 'expo-blur';
+import * as Haptics from 'expo-haptics';
 
 const { width } = Dimensions.get('window');
 const boxSize = width * 0.7;
 
 export default function ScannerScreen({ navigation }) {
   const [permission, requestPermission] = useCameraPermissions();
-  const [scanned, setScanned] = useState(false);
-
+  const [scanState, setScanState] = useState('idle'); // 'idle', 'success', 'duplicate', 'error'
+  
+  // Throttle refs to prevent lag
+  const isProcessing = useRef(false);
+  const lastScannedRef = useRef(null);
+  
   // Animation values
   const lineAnim = useRef(new Animated.Value(0)).current;
   const pulseAnim = useRef(new Animated.Value(1)).current;
+  const toastSlideAnim = useRef(new Animated.Value(-150)).current; // Slide down from top
 
   useEffect(() => {
-    // Reset scanned state when returning to this screen
+    // Reset state when returning to this screen
     const unsubscribe = navigation.addListener('focus', () => {
-      setScanned(false);
+      resetScanner();
     });
     return unsubscribe;
   }, [navigation]);
 
   useEffect(() => {
-    if (!scanned && permission && permission.granted) {
+    if (scanState === 'idle' && permission && permission.granted) {
       startAnimations();
     } else {
       stopAnimations();
     }
-  }, [scanned, permission]);
+  }, [scanState, permission]);
+
+  const resetScanner = () => {
+    setScanState('idle');
+    lastScannedRef.current = null;
+    isProcessing.current = false;
+    Animated.timing(toastSlideAnim, {
+      toValue: -150, // Hide toast
+      duration: 300,
+      useNativeDriver: true,
+    }).start();
+  };
+
+  const showToast = () => {
+    Animated.timing(toastSlideAnim, {
+      toValue: 60, // Show toast (pixels from top)
+      duration: 400,
+      easing: Easing.out(Easing.back(1.5)),
+      useNativeDriver: true,
+    }).start();
+  };
 
   const startAnimations = () => {
-    // Laser line animation (moving up and down)
+    // Laser line animation
     Animated.loop(
       Animated.sequence([
         Animated.timing(lineAnim, {
@@ -50,11 +77,11 @@ export default function ScannerScreen({ navigation }) {
       ])
     ).start();
 
-    // Pulse animation for corners
+    // Pulse animation
     Animated.loop(
       Animated.sequence([
         Animated.timing(pulseAnim, {
-          toValue: 1.2,
+          toValue: 1.05,
           duration: 800,
           easing: Easing.inOut(Easing.ease),
           useNativeDriver: true,
@@ -96,23 +123,82 @@ export default function ScannerScreen({ navigation }) {
   }
 
   const handleBarcodeScanned = async ({ type, data }) => {
-    if (scanned) return;
-    setScanned(true);
+    if (isProcessing.current || scanState !== 'idle') return;
+    
+    // Throttling to prevent rapid-fire scanning of the same duplicate code
+    if (lastScannedRef.current === data) return;
+    
+    isProcessing.current = true;
+    lastScannedRef.current = data;
     
     try {
       await saveScannedCode(data);
-      Alert.alert(
-        "Code Scanned!",
-        `Data: ${data}`,
-        [
-          { text: "Scan Another", onPress: () => setScanned(false) },
-          { text: "View Dashboard", onPress: () => navigation.navigate('Dashboard') }
-        ]
-      );
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      setScanState('success');
+      showToast();
+      
+      // Auto transition to dashboard on success
+      setTimeout(() => {
+         navigation.navigate('Dashboard');
+      }, 1500);
+
     } catch (e) {
-      Alert.alert("Error", "Failed to save scanned code.");
-      setScanned(false);
+      if (e.code === 'DUPLICATE_CODE') {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+        setScanState('duplicate');
+        showToast();
+        
+        // Auto-resume after 2 seconds for duplicates
+        setTimeout(() => {
+           resetScanner();
+        }, 2000);
+      } else {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+        setScanState('error');
+        showToast();
+        
+        // Auto-resume after 2 seconds for errors
+        setTimeout(() => {
+           resetScanner();
+        }, 2000);
+      }
     }
+  };
+
+  // Determine viewfinder color based on state
+  const getBorderColor = () => {
+    if (scanState === 'success') return '#34C759'; // Green
+    if (scanState === 'duplicate' || scanState === 'error') return '#FF3B30'; // Red
+    return '#0A84FF'; // Blue (Idle)
+  };
+
+  const borderColor = getBorderColor();
+
+  const renderToast = () => {
+    const isSuccess = scanState === 'success';
+    const isDuplicate = scanState === 'duplicate';
+    const isError = scanState === 'error';
+    
+    if (scanState === 'idle') return null;
+
+    const iconName = isSuccess ? 'check-circle' : isDuplicate ? 'alert-circle' : 'close-circle';
+    const iconColor = isSuccess ? '#34C759' : isDuplicate ? '#FF9F0A' : '#FF3B30';
+    const titleText = isSuccess ? 'Success' : isDuplicate ? 'Already Scanned' : 'Error';
+    const subtitleText = isSuccess ? 'Code captured successfully' : isDuplicate ? 'This code has already been processed' : 'Failed to save code';
+
+    return (
+      <Animated.View style={[styles.toastContainer, { transform: [{ translateY: toastSlideAnim }] }]} pointerEvents="none">
+        <BlurView intensity={70} tint="dark" style={styles.toastBlur}>
+          <View style={styles.toastContent}>
+             <MaterialCommunityIcons name={iconName} size={28} color={iconColor} style={styles.toastIcon} />
+             <View style={styles.toastTextContainer}>
+                <Text style={styles.toastTitle}>{titleText}</Text>
+                <Text style={styles.toastSubtitle}>{subtitleText}</Text>
+             </View>
+          </View>
+        </BlurView>
+      </Animated.View>
+    );
   };
 
   return (
@@ -120,49 +206,59 @@ export default function ScannerScreen({ navigation }) {
       <CameraView 
         style={StyleSheet.absoluteFillObject}
         facing="back"
-        onBarcodeScanned={scanned ? undefined : handleBarcodeScanned}
+        onBarcodeScanned={handleBarcodeScanned}
         barcodeScannerSettings={{
           barcodeTypes: ["qr"],
         }}
-      >
-        <View style={styles.overlay}>
-          <View style={styles.header}>
-            <Text style={styles.headerText}>Scan QR Code</Text>
-            <Text style={styles.headerSubtext}>Align the QR code within the frame</Text>
-          </View>
-          
-          <View style={styles.scanArea}>
-            <Animated.View style={[styles.targetBox, { transform: [{ scale: pulseAnim }] }]}>
-              {/* Corners */}
-              <View style={[styles.corner, styles.topLeft]} />
-              <View style={[styles.corner, styles.topRight]} />
-              <View style={[styles.corner, styles.bottomLeft]} />
-              <View style={[styles.corner, styles.bottomRight]} />
-              
-              {/* Laser Line */}
-              {!scanned && (
-                <Animated.View 
-                  style={[
-                    styles.laserLine, 
-                    { transform: [{ translateY: lineAnim }] }
-                  ]} 
-                />
-              )}
-            </Animated.View>
-          </View>
+      />
+      
+      {/* Overlays must be outside CameraView to prevent crashes */}
+      <View style={styles.overlay} pointerEvents="box-none">
+        <View style={styles.header}>
+          <Text style={styles.headerText}>Scan QR Code</Text>
+          <Text style={styles.headerSubtext}>Align the QR code within the frame</Text>
+        </View>
+        
+        <View style={styles.scanArea} pointerEvents="none">
+          <Animated.View style={[styles.targetBox, { transform: [{ scale: pulseAnim }] }]}>
+            {/* Corners with dynamic color */}
+            <View style={[styles.corner, styles.topLeft, { borderColor }]} />
+            <View style={[styles.corner, styles.topRight, { borderColor }]} />
+            <View style={[styles.corner, styles.bottomLeft, { borderColor }]} />
+            <View style={[styles.corner, styles.bottomRight, { borderColor }]} />
+            
+            {/* Laser Line */}
+            {scanState === 'idle' && (
+              <Animated.View 
+                style={[
+                  styles.laserLine, 
+                  { transform: [{ translateY: lineAnim }] }
+                ]} 
+              />
+            )}
+            
+            {/* Glow effect on success/error/duplicate */}
+            {(scanState === 'success' || scanState === 'duplicate' || scanState === 'error') && (
+              <View style={[styles.glowBox, { backgroundColor: borderColor }]} />
+            )}
+          </Animated.View>
+        </View>
 
-          <View style={styles.footer}>
-            <TouchableOpacity 
-              style={styles.dashboardButton} 
-              onPress={() => navigation.navigate('Dashboard')}
-              activeOpacity={0.8}
-            >
+        <View style={styles.footer} pointerEvents="box-none">
+          <TouchableOpacity 
+            style={styles.dashboardButton} 
+            onPress={() => navigation.navigate('Dashboard')}
+            activeOpacity={0.8}
+          >
+            <BlurView intensity={40} tint="dark" style={styles.dashboardBlurButton}>
               <MaterialCommunityIcons name="view-dashboard" size={20} color="#fff" style={styles.buttonIcon} />
               <Text style={styles.dashboardButtonText}>View Dashboard</Text>
-            </TouchableOpacity>
-          </View>
+            </BlurView>
+          </TouchableOpacity>
         </View>
-      </CameraView>
+      </View>
+
+      {renderToast()}
     </View>
   );
 }
@@ -197,11 +293,6 @@ const styles = StyleSheet.create({
     paddingVertical: 16,
     paddingHorizontal: 32,
     borderRadius: 16,
-    shadowColor: '#0A84FF',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 10,
-    elevation: 8,
   },
   buttonText: {
     color: '#fff',
@@ -209,8 +300,8 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   overlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.65)',
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.5)',
     justifyContent: 'space-between',
   },
   header: {
@@ -245,7 +336,6 @@ const styles = StyleSheet.create({
     position: 'absolute',
     width: 50,
     height: 50,
-    borderColor: '#0A84FF',
   },
   topLeft: {
     top: 0,
@@ -289,17 +379,24 @@ const styles = StyleSheet.create({
     elevation: 5,
     borderRadius: 2,
   },
+  glowBox: {
+    ...StyleSheet.absoluteFillObject,
+    borderRadius: 24,
+    opacity: 0.2, // Soft glow
+  },
   footer: {
     padding: 50,
     alignItems: 'center',
   },
   dashboardButton: {
+    borderRadius: 30,
+    overflow: 'hidden',
+  },
+  dashboardBlurButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: 'rgba(255,255,255,0.15)',
     paddingVertical: 16,
     paddingHorizontal: 32,
-    borderRadius: 30,
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.2)',
   },
@@ -311,5 +408,47 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
     letterSpacing: 0.5,
+  },
+  toastContainer: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    zIndex: 100,
+  },
+  toastBlur: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 30,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
+    overflow: 'hidden',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.3,
+    shadowRadius: 20,
+  },
+  toastContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  toastIcon: {
+    marginRight: 12,
+  },
+  toastTextContainer: {
+    flexDirection: 'column',
+  },
+  toastTitle: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  toastSubtitle: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: 13,
+    fontWeight: '500',
   },
 });
